@@ -6,23 +6,30 @@
 
 #include "../int128.hpp"
 
-union VU_R
+union alignas(16) VU_R
 {
     float f;
     uint32_t u;
+    char padding[16];
 };
 
-union VU_GPR
+//The GPRs need to be aligned on a 16-byte boundary so that SSE instructions can work on them.
+union alignas(16) VU_GPR
 {
     float f[4];
     uint32_t u[4];
     int32_t s[4];
 };
 
-union VU_I
+union alignas(8) VU_I
 {
     uint16_t u;
     int16_t s;
+};
+
+struct alignas(16) VU_Mem
+{
+    uint8_t m[1024 * 16];
 };
 
 struct VPU_STAT
@@ -40,24 +47,28 @@ struct DecodedRegs
     uint8_t vf_read0_field[2], vf_read1_field[2];
 
     uint8_t vi_read0, vi_read1, vi_write;
+
+    void reset();
 };
 
 class GraphicsInterface;
 class Emulator;
+class VU_JIT64;
 
 class VectorUnit
 {
     private:
         GraphicsInterface* gif;
         int id;
+        uint16_t mem_mask; //0xFFF for VU0, 0x3FFF for VU1
         Emulator* e;
 
-        uint64_t cycle_count;
+        uint64_t cycle_count; //Increments when "running" is true
+        uint64_t run_event; //If less than cycle_count, the VU is allowed to run
 
         uint16_t *VIF_TOP, *VIF_ITOP;
 
-        uint8_t instr_mem[1024 * 16];
-        uint8_t data_mem[1024 * 16];
+        VU_Mem instr_mem, data_mem;
 
         bool running;
         uint16_t PC, new_PC, secondbranch_PC;
@@ -132,10 +143,12 @@ class VectorUnit
         void flush_pipes();
 
         void run(int cycles);
+        void run_jit(int cycles);
         void handle_XGKICK();
         void callmsr();
         void mscal(uint32_t addr);
         void end_execution();
+        void stop();
         void reset();
 
         void backup_vf(bool newvf, int index);
@@ -157,11 +170,14 @@ class VectorUnit
         int get_id();
         void set_gpr_f(int index, int field, float value);
         void set_gpr_u(int index, int field, uint32_t value);
+        void set_gpr_s(int index, int field, int32_t value);
         void set_int(int index, uint16_t value);
         void set_status(uint32_t value);
         void set_R(uint32_t value);
         void set_I(uint32_t value);
         void set_Q(uint32_t value);
+
+        uint8_t* get_instr_mem();
 
         uint32_t cfc(int index);
         void ctc(int index, uint32_t value);
@@ -291,42 +307,38 @@ class VectorUnit
 
         void load_state(std::ifstream& state);
         void save_state(std::ofstream& state);
+
+        //Friends needed for JIT convenience
+        friend class VU_JIT64;
+
+        friend void vu_start_q_event(VectorUnit& vu, int latency, int cycles);
+        friend void vu_check_q_pipeline(VectorUnit& vu, int cycles);
+        friend void vu_update_xgkick(VectorUnit& vu, int cycles);
+        friend void vu_update_pipelines(VectorUnit& vu);
 };
 
 template <typename T>
 inline T VectorUnit::read_instr(uint32_t addr)
 {
-    uint16_t mask = 0x3fff;
-    if (get_id() == 0)
-        mask = 0xfff;
-    return *(T*)&instr_mem[addr & mask];
+    return *(T*)&instr_mem.m[addr & mem_mask];
 }
 
 template <typename T>
 inline T VectorUnit::read_data(uint32_t addr)
 {
-    uint16_t mask = 0x3fff;
-    if (get_id() == 0)
-        mask = 0xfff;
-    return *(T*)&data_mem[addr & mask];
+    return *(T*)&data_mem.m[addr & mem_mask];
 }
 
 template <typename T>
 inline void VectorUnit::write_instr(uint32_t addr, T data)
 {
-    uint16_t mask = 0x3fff;
-    if (get_id() == 0)
-        mask = 0xfff;
-     *(T*)&instr_mem[addr & mask] = data;
+    *(T*)&instr_mem.m[addr & mem_mask] = data;
 }
 
 template <typename T>
 inline void VectorUnit::write_data(uint32_t addr, T data)
 {
-    uint16_t mask = 0x3fff;
-    if (get_id() == 0)
-        mask = 0xfff;
-    *(T*)&data_mem[addr & mask] = data;
+    *(T*)&data_mem.m[addr & mem_mask] = data;
 }
 
 inline bool VectorUnit::is_running()
@@ -371,6 +383,12 @@ inline void VectorUnit::set_gpr_u(int index, int field, uint32_t value)
         gpr[index].u[field] = value;
 }
 
+inline void VectorUnit::set_gpr_s(int index, int field, int32_t value)
+{
+    if (index)
+        gpr[index].s[field] = value;
+}
+
 inline void VectorUnit::set_int(int index, uint16_t value)
 {
     if (index)
@@ -395,6 +413,11 @@ inline void VectorUnit::set_I(uint32_t value)
 inline void VectorUnit::set_Q(uint32_t value)
 {
     new_Q_instance.u = value;
+}
+
+inline uint8_t* VectorUnit::get_instr_mem()
+{
+    return (uint8_t*)instr_mem.m;
 }
 
 #endif // VU_HPP

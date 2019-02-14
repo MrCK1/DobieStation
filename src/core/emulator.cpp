@@ -6,6 +6,8 @@
 #include "emulator.hpp"
 #include "errors.hpp"
 
+#include "ee/vu_jit.hpp"
+
 #define CYCLES_PER_FRAME 4900000
 #define VBLANK_START CYCLES_PER_FRAME * 0.75
 
@@ -14,10 +16,10 @@
 #define EELOAD_SIZE 0x20000
 
 Emulator::Emulator() :
-    cp0(&dmac), cdvd(this), dmac(&ee, this, &gif, &ipu, &sif, &vif0, &vif1),
-    ee(&cp0, &fpu, this, (uint8_t*)&scratchpad, &vu0, &vu1), timers(&intc), gs(&intc), gif(&gs),
-    iop(this), iop_dma(this, &cdvd, &sif, &sio2, &spu, &spu2), iop_timers(this), intc(&ee), ipu(&intc),
-    sio2(this, &pad, &memcard), spu(1, this), spu2(2, this), vif0(nullptr, &vu0, &intc, 0),
+    cdvd(this), cp0(&dmac), cpu(&cp0, &fpu, this, (uint8_t*)&scratchpad, &vu0, &vu1),
+    dmac(&cpu, this, &gif, &ipu, &sif, &vif0, &vif1), gif(&gs), gs(&intc),
+    iop(this), iop_dma(this, &cdvd, &sif, &sio2, &spu, &spu2), iop_timers(this), intc(&cpu), ipu(&intc),
+    timers(&intc), sio2(this, &pad, &memcard), spu(1, this), spu2(2, this), vif0(nullptr, &vu0, &intc, 0),
     vif1(&gif, &vu1, &intc, 1), vu0(0, this), vu1(1, this)
 {
     BIOS = nullptr;
@@ -78,8 +80,7 @@ void Emulator::run()
     
     while (instructions_run < CYCLES_PER_FRAME)
     {
-        int cycles = 16;
-        ee.run(cycles);
+        int cycles = cpu.run(16);
         instructions_run += cycles;
         cycles >>= 1;
         dmac.run(cycles);
@@ -88,7 +89,8 @@ void Emulator::run()
         vif0.update(cycles);
         vif1.update(cycles);
         vu0.run(cycles);
-        vu1.run(cycles);
+        //vu1.run(cycles);
+        vu1.run_jit(cycles);
         cycles >>= 2;
         iop_timers.run(cycles);
         iop_dma.run(cycles);
@@ -111,7 +113,7 @@ void Emulator::run()
             gs.set_VBLANK(true);
             timers.gate(true, true);
             cdvd.vsync();
-            //ee.set_disassembly(frames == 263);
+            //cpu.set_disassembly(frames == 3037);
             printf("VSYNC FRAMES: %d\n", frames);
             gs.assert_VSYNC();
             frames++;
@@ -119,59 +121,11 @@ void Emulator::run()
             gs.render_CRT();
         }
     }
-
     fesetround(originalRounding);
     //VBLANK end
     iop_request_IRQ(11);
     gs.set_VBLANK(false);
     timers.gate(true, false);
-}
-
-//Only intended to be used for debugging
-void Emulator::step()
-{
-    ee.run(1);
-    instructions_run++;
-    dmac.run(1);
-    timers.run(1);
-    ipu.run();
-    vif0.update(1);
-    vif1.update(1);
-    vu0.run(1);
-    vu1.run(1);
-    iop_timers.run(1);
-    iop_dma.run(1);
-    iop.run(1);
-    if (iop_i_ctrl_delay)
-    {
-        iop_i_ctrl_delay--;
-        if (!iop_i_ctrl_delay)
-            iop.interrupt_check(IOP_I_CTRL && (IOP_I_MASK & IOP_I_STAT));
-    }
-    spu.update(1);
-    spu2.update(1);
-    cdvd.update(1);
-    if (!VBLANK_sent && instructions_run >= VBLANK_START)
-    {
-        VBLANK_sent = true;
-        gs.set_VBLANK(true);
-        timers.gate(true, true);
-        cdvd.vsync();
-        //ee.set_disassembly(frames == 263);
-        printf("VSYNC FRAMES: %d\n", frames);
-        gs.assert_VSYNC();
-        frames++;
-        iop_request_IRQ(0);
-        gs.render_CRT();
-    }
-
-    if (instructions_run >= CYCLES_PER_FRAME)
-    {
-        instructions_run -= CYCLES_PER_FRAME;
-        iop_request_IRQ(11);
-        gs.set_VBLANK(false);
-        timers.gate(true, false);
-    }
 }
 
 void Emulator::reset()
@@ -194,7 +148,7 @@ void Emulator::reset()
 
     cdvd.reset();
     cp0.reset();
-    ee.reset();
+    cpu.reset();
     dmac.reset(RDRAM, (uint8_t*)&scratchpad);
     fpu.reset();
     gs.reset();
@@ -214,6 +168,8 @@ void Emulator::reset()
     vif1.reset();
     vu0.reset();
     vu1.reset();
+    VU_JIT::reset();
+
     MCH_DRD = 0;
     MCH_RICM = 0;
     rdram_sdevid = 0;
@@ -306,7 +262,7 @@ void Emulator::fast_boot()
                 {
                     if (read32(ptr) == str)
                     {
-                        uint32_t argv = ee.get_gpr<uint32_t>(5) + 0x40;
+                        uint32_t argv = cpu.get_gpr<uint32_t>(5) + 0x40;
                         strcpy((char*)&RDRAM[argv], path.c_str());
                         write32(ptr, argv);
                     }
@@ -394,7 +350,7 @@ void Emulator::execute_ELF()
             mem_w += 4;
         }
     }
-    ee.set_PC(e_entry);
+    cpu.set_PC(e_entry);
 }
 
 void Emulator::clear_cop2_interlock()
@@ -686,8 +642,6 @@ void Emulator::write32(uint32_t address, uint32_t value)
 {
     if (address < 0x10000000)
     {
-        if (address == 0x180)
-            printf("[Emulator] Write to exception: $%08X\n", value);
         *(uint32_t*)&RDRAM[address & 0x01FFFFFF] = value;
         return;
     }
@@ -1656,19 +1610,7 @@ void Emulator::request_gsdump_toggle()
 {
     gsdump_requested = true;
 }
-
 void Emulator::request_gsdump_single_frame()
 {
     gsdump_single_frame = true;
-}
-
-DebugInfo* Emulator::get_debug_info()
-{
-    debug_info.ee = &ee;
-    debug_info.iop = &iop;
-    debug_info.ee_cop0 = &cp0;
-    debug_info.fpu = &fpu;
-    debug_info.vu0 = &vu0;
-    debug_info.vu1 = &vu1;
-    return &debug_info;
 }

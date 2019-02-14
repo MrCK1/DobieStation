@@ -24,6 +24,7 @@ SOURCES += ../src/qt/main.cpp \
     ../src/core/ee/cop0.cpp \
     ../src/core/ee/cop1.cpp \
     ../src/core/ee/emotion_mmi.cpp \
+    ../src/core/ee/bios_hle.cpp \
     ../src/core/ee/emotion_special.cpp \
     ../src/core/gs.cpp \
     ../src/core/gsregisters.cpp \
@@ -72,8 +73,13 @@ SOURCES += ../src/qt/main.cpp \
     ../src/core/serialize.cpp \
     ../src/core/iop/memcard.cpp \
     ../src/qt/settings.cpp \
-    ../src/qt/debugwindow.cpp \
-    ../src/qt/breakpointwindow.cpp
+    ../src/core/jitcommon/jitcache.cpp \
+    ../src/core/jitcommon/emitter64.cpp \
+    ../src/core/ee/vu_jittrans.cpp \
+    ../src/core/jitcommon/ir_block.cpp \
+    ../src/core/jitcommon/ir_instr.cpp \
+    ../src/core/ee/vu_jit.cpp \
+    ../src/core/ee/vu_jit64.cpp
 
 HEADERS += \
     ../src/core/errors.hpp \
@@ -82,6 +88,7 @@ HEADERS += \
     ../src/core/ee/emotioninterpreter.hpp \
     ../src/core/ee/cop0.hpp \
     ../src/core/ee/cop1.hpp \
+    ../src/core/ee/bios_hle.hpp \
     ../src/core/gs.hpp \
     ../src/core/circularFIFO.hpp \
     ../src/core/gsthread.hpp \
@@ -127,6 +134,13 @@ HEADERS += \
     ../src/core/gsmem.hpp \
     ../src/core/iop/memcard.hpp \
     ../src/qt/settings.hpp \
-    ../src/qt/debugwindow.hpp \
-    ../src/core/debuginfo.hpp \
-    ../src/qt/breakpointwindow.hpp
+    ../src/core/jitcommon/jitcache.hpp \
+    ../src/core/jitcommon/emitter64.hpp \
+    ../src/core/ee/vu_jittrans.hpp \
+    ../src/core/jitcommon/ir_block.hpp \
+    ../src/core/jitcommon/ir_instr.hpp \
+    ../src/core/ee/vu_jit.hpp \
+    ../src/core/ee/vu_jit64.hpp
+
+DISTFILES += \
+    ../src/core/jitcommon/ir_instrlist.inc

@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include "vu.hpp"
 #include "vu_interpreter.hpp"
+#include "vu_jit.hpp"
 
 #include "../emulator.hpp"
 #include "../errors.hpp"
@@ -33,6 +34,39 @@
 
 uint32_t VectorUnit::FBRST = 0;
 
+/**
+ * The VU max and min instructions support denormals.
+ * Because of this, we must compare registers as signed integers instead of floats.
+ */
+int32_t vu_max(int32_t a, int32_t b)
+{
+    if (a < 0 && b < 0)
+        return std::min(a, b);
+    return std::max(a, b);
+}
+
+int32_t vu_min(int32_t a, int32_t b)
+{
+    if (a < 0 && b < 0)
+        return std::max(a, b);
+    return std::min(a, b);
+}
+
+void DecodedRegs::reset()
+{
+    vf_read0[0] = 0; vf_read0[1] = 0;
+    vf_read0_field[0] = 0; vf_read0_field[1] = 0;
+
+    vf_read1[0] = 0; vf_read1[1] = 0;
+    vf_read1_field[0] = 0; vf_read1_field[1] = 0;
+
+    vf_write[0] = 0; vf_write[1] = 0;
+    vf_write_field[0] = 0; vf_write_field[1] = 0;
+
+    vi_read0 = 0; vi_read1 = 0;
+    vi_write = 0;
+}
+
 VectorUnit::VectorUnit(int id, Emulator* e) : id(id), e(e), gif(nullptr)
 {
     gpr[0].f[0] = 0.0;
@@ -40,6 +74,11 @@ VectorUnit::VectorUnit(int id, Emulator* e) : id(id), e(e), gif(nullptr)
     gpr[0].f[2] = 0.0;
     gpr[0].f[3] = 1.0;
     int_gpr[0].u = 0;
+
+    if (id == 0)
+        mem_mask = 0xFFF;
+    else
+        mem_mask = 0x3FFF;
 
     VIF_TOP = nullptr;
     VIF_ITOP = nullptr;
@@ -55,6 +94,7 @@ void VectorUnit::reset()
     clip_flags = 0;
     PC = 0;
     cycle_count = 1; //Set to 1 to prevent spurious events from occurring during execution
+    run_event = 0;
     running = false;
     finish_on = false;
     branch_on = false;
@@ -145,10 +185,19 @@ void VectorUnit::run(int cycles)
                 handle_XGKICK();
         }
 
-        uint32_t upper_instr = *(uint32_t*)&instr_mem[PC + 4];
-        uint32_t lower_instr = *(uint32_t*)&instr_mem[PC];
+        uint32_t upper_instr = *(uint32_t*)&instr_mem.m[PC + 4];
+        uint32_t lower_instr = *(uint32_t*)&instr_mem.m[PC];
         //printf("[$%08X] $%08X:$%08X\n", PC, upper_instr, lower_instr);
         VU_Interpreter::interpret(*this, upper_instr, lower_instr);
+
+        /*if (PC == 0x13B8 || PC == 0x1380)
+        {
+            for (int i = 0; i < 32; i++)
+            {
+                printf("vf%d: (%f, %f, %f, %f)\n", i, gpr[i].f[3], gpr[i].f[2], gpr[i].f[1], gpr[i].f[0]);
+                printf("vf%d: ($%08X, $%08X, $%08X, $%08X)\n", i, gpr[i].u[3], gpr[i].u[2], gpr[i].u[1], gpr[i].u[0]);
+            }
+        }*/
 
         PC += 8;
 
@@ -196,19 +245,51 @@ void VectorUnit::run(int cycles)
     }
 }
 
+void VectorUnit::run_jit(int cycles)
+{
+    cycle_count += cycles;
+    if ((!running || XGKICK_stall) && transferring_GIF)
+    {
+        gif->request_PATH(1, true);
+        while (cycles > 0 && gif->path_active(1))
+        {
+            cycles--;
+            handle_XGKICK();
+        }
+    }
+    while (running && !XGKICK_stall && run_event < cycle_count)
+    {
+        run_event += VU_JIT::run(this);
+
+        /*if (PC > 0x1200 && PC < 0x1500)
+        {
+            for (int i = 0; i < 32; i++)
+            {
+                printf("vf%d: (%f, %f, %f, %f)\n", i, gpr[i].f[3], gpr[i].f[2], gpr[i].f[1], gpr[i].f[0]);
+                printf("vf%d: ($%08X, $%08X, $%08X, $%08X)\n", i, gpr[i].u[3], gpr[i].u[2], gpr[i].u[1], gpr[i].u[0]);
+            }
+            //printf("mac: $%04X $%04X $%04X $%04X\n", MAC_pipeline[0], MAC_pipeline[1], MAC_pipeline[2], *MAC_flags & 0xFFFF);
+            //for (int i = 0; i < 16; i++)
+                //printf("vi%d: $%04X\n", i, int_gpr[i].u);
+            //printf("clip: $%08X ($%04X)\n", clip_flags, 0 - ((clip_flags & 0x3FFFF) != 0));
+        }*/
+    }
+}
+
 void VectorUnit::handle_XGKICK()
 {
     uint128_t quad = read_data<uint128_t>(GIF_addr);
     GIF_addr += 16;
     if (gif->send_PATH1(quad))
     {
-        //printf("[VU1] XGKICK transfer ended!\n");
+        printf("[VU1] XGKICK transfer ended!\n");
         if (XGKICK_stall)
         {
-            printf("[VU1] Activating stalled XGKICK transfer\n");
+            //printf("[VU1] Activating stalled XGKICK transfer\n");
             XGKICK_cycles = 0;
             XGKICK_stall = false;
             GIF_addr = stalled_GIF_addr;
+            run_event = cycle_count;
         }
         else
         {
@@ -326,6 +407,7 @@ void VectorUnit::callmsr()
         running = true;
         PC = CMSAR0 * 8;
     }
+    run_event = cycle_count;
 }
 
 void VectorUnit::mscal(uint32_t addr)
@@ -336,12 +418,19 @@ void VectorUnit::mscal(uint32_t addr)
         running = true;
         PC = addr;
     }
+    run_event = cycle_count;
 }
 
 void VectorUnit::end_execution()
 {
     ebit_delay_slot = 1;
     finish_on = true;
+}
+
+void VectorUnit::stop()
+{
+    running = false;
+    flush_pipes();
 }
 
 float VectorUnit::update_mac_flags(float value, int index)
@@ -575,10 +664,14 @@ void VectorUnit::branch(bool condition, int16_t imm, bool link, uint8_t linkreg)
             branch_on = true;
             branch_delay_slot = 1;
             new_PC = ((int16_t)PC + imm + 8) & 0x3fff;
+            if (get_id() == 1)
+                printf("[VU1] New block at $%04X\n", new_PC);
             if (link)
                 set_int(linkreg, (PC + 16) / 8);
         }
     }
+    else if (get_id() == 1)
+        printf("[VU1] New block at $%04X\n", PC + 16);
 }
 
 void VectorUnit::jp(uint16_t addr, bool link, uint8_t linkreg)
@@ -595,6 +688,8 @@ void VectorUnit::jp(uint16_t addr, bool link, uint8_t linkreg)
         new_PC = addr & 0x3FFF;
         branch_on = true;
         branch_delay_slot = 1;
+        if (get_id() == 1)
+            printf("[VU1] New block at $%04X\n", new_PC);
         if (link)
             set_int(linkreg, (PC + 16) / 8);
     }
@@ -781,7 +876,7 @@ void VectorUnit::bal(uint32_t instr)
 
 void VectorUnit::clip(uint32_t instr)
 {
-    printf("[VU] CLIP\n");
+    printf("[VU] CLIP $%08X (%d, %d)\n", instr, _fs_, _ft_);
     clip_flags <<= 6; //Move previous clipping judgments up
 
     //Compare x, y, z fields of FS with the w field of FT
@@ -791,6 +886,8 @@ void VectorUnit::clip(uint32_t instr)
     float y = convert(gpr[_fs_].u[1]);
     float z = convert(gpr[_fs_].u[2]);
 
+    printf("Compare: (%f, %f, %f) %f\n", x, y, z, value);
+
     clip_flags |= (x > +value);
     clip_flags |= (x < -value) << 1;
     clip_flags |= (y > +value) << 2;
@@ -798,6 +895,8 @@ void VectorUnit::clip(uint32_t instr)
     clip_flags |= (z > +value) << 4;
     clip_flags |= (z < -value) << 5;
     clip_flags &= 0xFFFFFF;
+
+    printf("New flags: $%08X\n", clip_flags);
 }
 
 void VectorUnit::div(uint32_t instr)
@@ -958,7 +1057,6 @@ void VectorUnit::ersqrt(uint32_t instr)
     P.f = sqrt(fabs(P.f));
     if (P.f != 0)
         P.f = 1.0f / P.f;
-
 
     printf("[VU] ERSQRT: %f (%d)\n", P.f, _fs_);
 }
@@ -1427,6 +1525,7 @@ void VectorUnit::lqi(uint32_t instr)
             printf("(%d)%f ", i, gpr[_ft_].f[i]);
         }
     }
+    printf("\n(%d: $%04X)", _is_, int_gpr[_is_]);
     if (_is_)
         int_gpr[_is_].u++;
     printf("\n");
@@ -1581,12 +1680,9 @@ void VectorUnit::max(uint32_t instr)
     {
         if (_field & (1 << (3 - i)))
         {
-            float op1 = convert(gpr[_fs_].u[i]);
-            float op2 = convert(gpr[_ft_].u[i]);
-            if (op1 > op2)
-                set_gpr_f(_fd_, i, op1);
-            else
-                set_gpr_f(_fd_, i, op2);
+            int32_t op1 = gpr[_fs_].s[i];
+            int32_t op2 = gpr[_ft_].s[i];
+            set_gpr_s(_fd_, i, vu_max(op1, op2));
             printf("(%d)%f ", i, gpr[_fd_].f[i]);
         }
     }
@@ -1596,16 +1692,13 @@ void VectorUnit::max(uint32_t instr)
 void VectorUnit::maxi(uint32_t instr)
 {
     printf("[VU] MAXi: ");
-    float op1 = convert(I.u);
+    int32_t op1 = (int32_t)I.u;
     for (int i = 0; i < 4; i++)
     {
         if (_field & (1 << (3 - i)))
         {
-            float op2 = convert(gpr[_fs_].u[i]);
-            if (op1 > op2)
-                set_gpr_f(_fd_, i, op1);
-            else
-                set_gpr_f(_fd_, i, op2);
+            int32_t op2 = gpr[_ft_].s[i];
+            set_gpr_s(_fd_, i, vu_max(op1, op2));
             printf("(%d)%f ", i, gpr[_fd_].f[i]);
         }
     }
@@ -1615,16 +1708,13 @@ void VectorUnit::maxi(uint32_t instr)
 void VectorUnit::maxbc(uint32_t instr)
 {
     printf("[VU] MAXbc: ");
-    float op = convert(gpr[_ft_].u[_bc_]);
+    int32_t op2 = gpr[_ft_].s[_bc_];
     for (int i = 0; i < 4; i++)
     {
         if (_field & (1 << (3 - i)))
         {
-            float op2 = convert(gpr[_fs_].u[i]);
-            if (op > op2)
-                set_gpr_f(_fd_, i, op);
-            else
-                set_gpr_f(_fd_, i, op2);
+            int32_t op1 = gpr[_fs_].s[i];
+            set_gpr_s(_fd_, i, vu_max(op1, op2));
             printf("(%d)%f ", i, gpr[_fd_].f[i]);
         }
     }
@@ -1658,12 +1748,9 @@ void VectorUnit::mini(uint32_t instr)
     {
         if (_field & (1 << (3 - i)))
         {
-            float op1 = convert(gpr[_fs_].u[i]);
-            float op2 = convert(gpr[_ft_].u[i]);
-            if (op1 < op2)
-                set_gpr_f(_fd_, i, op1);
-            else
-                set_gpr_f(_fd_, i, op2);
+            int32_t op1 = gpr[_fs_].s[i];
+            int32_t op2 = gpr[_ft_].s[i];
+            set_gpr_s(_fd_, i, vu_min(op1, op2));
             printf("(%d)%f ", i, gpr[_fd_].f[i]);
         }
     }
@@ -1673,16 +1760,13 @@ void VectorUnit::mini(uint32_t instr)
 void VectorUnit::minibc(uint32_t instr)
 {
     printf("[VU] MINIbc: ");
-    float op = convert(gpr[_ft_].u[_bc_]);
+    int32_t op1 = gpr[_ft_].s[_bc_];
     for (int i = 0; i < 4; i++)
     {
         if (_field & (1 << (3 - i)))
         {
-            float op2 = convert(gpr[_fs_].u[i]);
-            if (op < op2)
-                set_gpr_f(_fd_, i, op);
-            else
-                set_gpr_f(_fd_, i, op2);
+            int32_t op2 = gpr[_fs_].s[i];
+            set_gpr_s(_fd_, i, vu_min(op1, op2));
             printf("(%d)%f", i, gpr[_fd_].f[i]);
         }
     }
@@ -1692,16 +1776,13 @@ void VectorUnit::minibc(uint32_t instr)
 void VectorUnit::minii(uint32_t instr)
 {
     printf("[VU] MINIi: ");
-    float op = convert(I.u);
+    int32_t op1 = (int32_t)I.u;
     for (int i = 0; i < 4; i++)
     {
         if (_field & (1 << (3 - i)))
         {
-            float op2 = convert(gpr[_fs_].u[i]);
-            if (op < op2)
-                set_gpr_f(_fd_, i, op);
-            else
-                set_gpr_f(_fd_, i, op2);
+            int32_t op2 = gpr[_fs_].s[i];
+            set_gpr_s(_fd_, i, vu_min(op1, op2));
             printf("(%d)%f", i, gpr[_fd_].f[i]);
         }
     }
@@ -2048,6 +2129,13 @@ void VectorUnit::opmsub(uint32_t instr)
     set_gpr_f(_fd_, 0, update_mac_flags(temp.f[0], 0));
     set_gpr_f(_fd_, 1, update_mac_flags(temp.f[1], 1));
     set_gpr_f(_fd_, 2, update_mac_flags(temp.f[2], 2));
+
+    /*if (_fd_ == 1 && (PC == 0x510))
+    {
+        clear_mac_flags(0);
+        clear_mac_flags(1);
+        clear_mac_flags(2);
+    }*/
     clear_mac_flags(3);
     printf("[VU] OPMSUB: %f, %f, %f\n", gpr[_fd_].f[0], gpr[_fd_].f[1], gpr[_fd_].f[2]);
 }
